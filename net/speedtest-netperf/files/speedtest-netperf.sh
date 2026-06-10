@@ -32,7 +32,7 @@
 # For more information, consult the online README.md:
 # https://github.com/openwrt/packages/blob/master/net/speedtest-netperf/files/README.md
 
-# Usage: speedtest-netperf.sh [-4 | -6] [ -H netperf-server ] [ -t duration ] [ -p host-to-ping ] [ -n simultaneous-streams ] [ -s | -c [duration] ] [ -i [duration] ]
+# Usage: speedtest-netperf.sh [-4 | -6] [ -H netperf-server ] [ -t duration ] [ -p host-to-ping ] [ -n simultaneous-streams ] [ -s | -c [duration] ] [ -i [duration] ] [ -o output-file ] [ -j ] [ -v ] [ -h ]
 
 # Options: If options are present:
 #
@@ -46,16 +46,39 @@
 #                based on whether concurrent or sequential upload/downloads)
 # -s | -c:       Sequential or concurrent download/upload (default - disabled)
 # -i | --idle:   Measure idle latency before speed test (default - disabled)
+# -o | --output: Save results to file (JSON format if file ends with .json)
+# -j | --json:   Output results in JSON format to stdout
+# -v | --verbose: Enable verbose/debug output
+# -h | --help:   Display this help message
 
 # Copyright (c) 2014 - Rich Brown <rich.brown@blueberryhillsoftware.com>
 # Copyright (c) 2018-2024 - Tony Ambardar <itugrok@yahoo.com>
 # GPLv2
 
+SCRIPT_VERSION="2.1"
+
+# Logging function for verbose output
+log_verbose() {
+	if [ "${VERBOSE}" -eq 1 ]; then
+		echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+	fi
+}
+
+# Error logging function
+log_error() {
+	echo "[ERROR] $*" >&2
+}
 
 # Summarize contents of the ping's output file as min, avg, median, max, etc.
 #   input parameter ($1) file contains the output of the ping command
 
 summarize_pings() {
+	local ping_file="$1"
+	
+	if [ ! -f "$ping_file" ]; then
+		log_error "Ping file not found: $ping_file"
+		return 1
+	fi
 
 # Process the ping times, and summarize the results
 # grep to keep lines with "time=", and sed to isolate time stamps and sort them
@@ -63,7 +86,7 @@ summarize_pings() {
 # and computes average.
 # If the number of samples is >= 10, also computes median, and 10th and 90th
 # percentile readings.
-	sed 's/^.*time=\([^ ]*\) ms/\1 pingtime/' < $1 | grep -v "PING" | sort -n | awk '
+	sed 's/^.*time=\([^ ]*\) ms/\1 pingtime/' < "$ping_file" | grep -v "PING" | sort -n | awk '
 BEGIN {numdrops=0; numrows=0;}
 {
 	if ( $2 == "pingtime" ) {
@@ -94,7 +117,14 @@ END {
 #   input parameter ($1) file contains CPU load/frequency samples
 
 summarize_load() {
-	cat $1 /proc/$$/stat | awk -v SCRIPT_PID=$$ '
+	local load_file="$1"
+	
+	if [ ! -f "$load_file" ]; then
+		log_error "Load file not found: $load_file"
+		return 1
+	fi
+
+	cat "$load_file" /proc/$$/stat | awk -v SCRIPT_PID=$$ '
 # track CPU frequencies
 $1 == "cpufreq" {
 	sum_freq[$2]+=$3/1000
@@ -156,20 +186,29 @@ END {
 #   input parameter ($2) file contains speed info from netperf
 
 summarize_speed() {
-	printf "%9s: %6.2f Mbps\n" $1 $(awk '{s+=$1} END {print s}' $2)
+	local direction="$1"
+	local speed_file="$2"
+	
+	if [ ! -f "$speed_file" ]; then
+		log_error "Speed file not found: $speed_file"
+		return 1
+	fi
+	
+	printf "%9s: %6.2f Mbps\n" "$direction" "$(awk '{s+=$1} END {print s}' "$speed_file")"
 }
 
 # Capture process load, then per-CPU load/frequency info at 1-second intervals.
 
 sample_load() {
-	local cpus="$(find /sys/devices/system/cpu -name 'cpu[0-9]*' 2>/dev/null)"
+	local cpus
 	local f="cpufreq/scaling_cur_freq"
+	cpus="$(find /sys/devices/system/cpu -name 'cpu[0-9]*' 2>/dev/null)"
 	cat /proc/$$/stat
 	while : ; do
 		sleep 1s
 		grep "^cpu[0-9]*" /proc/stat
 		for c in $cpus; do
-			[ -r $c/$f ] && echo "cpufreq $(basename $c) $(cat $c/$f)"
+			[ -r "$c/$f" ] && echo "cpufreq $(basename "$c") $(cat "$c/$f")"
 		done
 	done
 }
@@ -187,63 +226,71 @@ print_dots() {
 # netperf writes the sole output value (in Mbps) to stdout when completed
 
 start_netperf() {
-	for i in $( seq $MAXSTREAMS ); do
-		netperf $TESTPROTO -H $TESTHOST -t $1 -l $SPEEDDUR -v 0 -P 0 >> $2 &
-#		echo "Starting PID $! params: $TESTPROTO -H $TESTHOST -t $1 -l $SPEEDDUR -v 0 -P 0 >> $2"
+	local test_type="$1"
+	local output_file="$2"
+	local i
+	
+	for i in $(seq "$MAXSTREAMS"); do
+		netperf "$TESTPROTO" -H "$TESTHOST" -t "$test_type" -l "$SPEEDDUR" -v 0 -P 0 >> "$output_file" &
+		log_verbose "Started netperf PID $! for $test_type"
 	done
 }
 
 # Wait until each of the background netperf processes completes
 
 wait_netperf() {
-	# gets a list of PIDs for child processes named 'netperf'
-#	echo "Process is $$"
-#	echo $(pgrep -P $$ netperf)
 	local err=0
+	local i
+	
 	for i in $(pgrep -P $$ netperf); do
-#	echo "Waiting for $i"
-		wait $i || err=1
+		log_verbose "Waiting for netperf process $i"
+		wait "$i" || err=1
 	done
 	return $err
 }
 
-# Stop the background netperf processes
+# Stop the background netperf processes with timeout protection
 
 kill_netperf() {
-	# gets a list of PIDs for child processes named 'netperf'
-#	echo "Process is $$"
-#	echo $(pgrep -P $$ netperf)
+	local i
+	log_verbose "Killing netperf processes"
 	for i in $(pgrep -P $$ netperf); do
-#	echo "Stopping $i"
-		kill -9 $i
-		wait $i 2>/dev/null
+		log_verbose "Terminating netperf process $i"
+		kill -9 "$i" 2>/dev/null
+		wait "$i" 2>/dev/null
 	done
 }
 
 # Stop the current sample_load() process
 
 kill_load() {
-#	echo "Load: $LOAD_PID"
-	kill -9 $LOAD_PID
-	wait $LOAD_PID 2>/dev/null
+	if [ -n "$LOAD_PID" ] && [ "$LOAD_PID" -gt 0 ]; then
+		log_verbose "Killing load sampling process $LOAD_PID"
+		kill -9 "$LOAD_PID" 2>/dev/null
+		wait "$LOAD_PID" 2>/dev/null
+	fi
 	LOAD_PID=0
 }
 
 # Stop the current print_dots() process
 
 kill_dots() {
-#	echo "Dots: $DOTS_PID"
-	kill -9 $DOTS_PID
-	wait $DOTS_PID 2>/dev/null
+	if [ -n "$DOTS_PID" ] && [ "$DOTS_PID" -gt 0 ]; then
+		log_verbose "Killing dots process $DOTS_PID"
+		kill -9 "$DOTS_PID" 2>/dev/null
+		wait "$DOTS_PID" 2>/dev/null
+	fi
 	DOTS_PID=0
 }
 
 # Stop the current ping process
 
 kill_pings() {
-#	echo "Pings: $PING_PID"
-	kill -9 $PING_PID
-	wait $PING_PID 2>/dev/null
+	if [ -n "$PING_PID" ] && [ "$PING_PID" -gt 0 ]; then
+		log_verbose "Killing ping process $PING_PID"
+		kill -9 "$PING_PID" 2>/dev/null
+		wait "$PING_PID" 2>/dev/null
+	fi
 	PING_PID=0
 }
 
@@ -251,15 +298,40 @@ kill_pings() {
 # ping command catches and handles first Ctrl-C, so you have to hit it again...
 
 kill_background_and_exit() {
+	log_verbose "Cleaning up background processes"
 	kill_netperf
 	kill_load
 	kill_dots
-	rm -f $DLFILE
-	rm -f $ULFILE
-	rm -f $LOADFILE
-	rm -f $PINGFILE
+	cleanup_temp_files
 	echo; echo "Stopped"
 	exit 1
+}
+
+# Cleanup temporary files
+cleanup_temp_files() {
+	rm -f "$DLFILE" 2>/dev/null
+	rm -f "$ULFILE" 2>/dev/null
+	rm -f "$LOADFILE" 2>/dev/null
+	rm -f "$PINGFILE" 2>/dev/null
+	if [ -n "$TEMPDIR" ] && [ -d "$TEMPDIR" ]; then
+		rm -rf "$TEMPDIR" 2>/dev/null
+	fi
+}
+
+# Check server connectivity
+check_server_connectivity() {
+	local server="$1"
+	local proto="$2"
+	
+	log_verbose "Checking connectivity to server: $server"
+	
+	if ping $proto -c 1 -W 2 "$server" >/dev/null 2>&1; then
+		log_verbose "Server $server is reachable"
+		return 0
+	else
+		log_error "Cannot reach server: $server"
+		return 1
+	fi
 }
 
 # Measure ping latency at idle as a baseline for comparison.
@@ -267,27 +339,28 @@ kill_background_and_exit() {
 measure_idle() {
 
 	# Create temp files for netperf up/download results
-	PINGFILE=$(mktemp /tmp/measurepings.XXXXXX) || exit 1
-	LOADFILE=$(mktemp /tmp/measureload.XXXXXX) || exit 1
-#	echo $PINGFILE $LOADFILE
+	PINGFILE=$(mktemp "$TEMPDIR/measurepings.XXXXXX") || { log_error "Failed to create ping temp file"; exit 1; }
+	LOADFILE=$(mktemp "$TEMPDIR/measureload.XXXXXX") || { log_error "Failed to create load temp file"; exit 1; }
+	
+	log_verbose "Created temp files: PINGFILE=$PINGFILE, LOADFILE=$LOADFILE"
 
 	# Start dots
 	print_dots &
 	DOTS_PID=$!
-#	echo "Dots PID: $DOTS_PID"
+	log_verbose "Started dots process: $DOTS_PID"
 
 	# Start Ping
-	ping $TESTPROTO $PINGHOST > $PINGFILE &
+	ping "$TESTPROTO" "$PINGHOST" > "$PINGFILE" 2>&1 &
 	PING_PID=$!
-#	echo "Ping PID: $PING_PID"
+	log_verbose "Started ping process: $PING_PID"
 
 	# Start CPU load sampling
-	sample_load > $LOADFILE &
+	sample_load > "$LOADFILE" 2>&1 &
 	LOAD_PID=$!
-#	echo "Load PID: $LOAD_PID"
+	log_verbose "Started load sampling process: $LOAD_PID"
 
 	# Wait for idle test period
-	sleep $IDLEDUR
+	sleep "$IDLEDUR"
 
 	# When idle time elapses, stop the CPU monitor, dots and pings
 	kill_load
@@ -296,14 +369,14 @@ measure_idle() {
 	echo
 
 	# Summarize the ping data
-	summarize_pings $PINGFILE
+	summarize_pings "$PINGFILE"
 
 	# Summarize the load data
-	summarize_load $LOADFILE
+	summarize_load "$LOADFILE"
 
 	# Clean up
-	rm -f $PINGFILE
-	rm -f $LOADFILE
+	rm -f "$PINGFILE" 2>/dev/null
+	rm -f "$LOADFILE" 2>/dev/null
 }
 
 # Measure speed, ping latency and cpu usage of netperf data transfers
@@ -313,41 +386,42 @@ measure_idle() {
 measure_direction() {
 
 	# Create temp files for netperf up/download results
-	ULFILE=$(mktemp /tmp/netperfUL.XXXXXX) || exit 1
-	DLFILE=$(mktemp /tmp/netperfDL.XXXXXX) || exit 1
-	PINGFILE=$(mktemp /tmp/measurepings.XXXXXX) || exit 1
-	LOADFILE=$(mktemp /tmp/measureload.XXXXXX) || exit 1
-#	echo $ULFILE $DLFILE $PINGFILE $LOADFILE
+	ULFILE=$(mktemp "$TEMPDIR/netperfUL.XXXXXX") || { log_error "Failed to create upload temp file"; exit 1; }
+	DLFILE=$(mktemp "$TEMPDIR/netperfDL.XXXXXX") || { log_error "Failed to create download temp file"; exit 1; }
+	PINGFILE=$(mktemp "$TEMPDIR/measurepings.XXXXXX") || { log_error "Failed to create ping temp file"; exit 1; }
+	LOADFILE=$(mktemp "$TEMPDIR/measureload.XXXXXX") || { log_error "Failed to create load temp file"; exit 1; }
+	
+	log_verbose "Created temp files: ULFILE=$ULFILE, DLFILE=$DLFILE, PINGFILE=$PINGFILE, LOADFILE=$LOADFILE"
 
-	local dir=$1
+	local dir="$1"
 	local spd_test
 
 	# Start dots
 	print_dots &
 	DOTS_PID=$!
-#	echo "Dots PID: $DOTS_PID"
+	log_verbose "Started dots process: $DOTS_PID"
 
 	# Start Ping
-	ping $TESTPROTO $PINGHOST > $PINGFILE &
+	ping "$TESTPROTO" "$PINGHOST" > "$PINGFILE" 2>&1 &
 	PING_PID=$!
-#	echo "Ping PID: $PING_PID"
+	log_verbose "Started ping process: $PING_PID"
 
 	# Start CPU load sampling
-	sample_load > $LOADFILE &
+	sample_load > "$LOADFILE" 2>&1 &
 	LOAD_PID=$!
-#	echo "Load PID: $LOAD_PID"
+	log_verbose "Started load sampling process: $LOAD_PID"
 
 	# Start netperf datastreams between client and server
-	if [ $dir = "Bidirectional" ]; then
-		start_netperf TCP_STREAM $ULFILE
-		start_netperf TCP_MAERTS $DLFILE
+	if [ "$dir" = "Bidirectional" ]; then
+		start_netperf TCP_STREAM "$ULFILE"
+		start_netperf TCP_MAERTS "$DLFILE"
 	else
 		# Start unidirectional netperf with the proper direction
-		case $dir in
+		case "$dir" in
 			Download) spd_test="TCP_MAERTS";;
 			Upload) spd_test="TCP_STREAM";;
 		esac
-		start_netperf $spd_test $DLFILE
+		start_netperf "$spd_test" "$DLFILE"
 	fi
 
 	# Wait until background netperf processes complete, check errors
@@ -365,31 +439,50 @@ measure_direction() {
 	echo
 
 	# Print TCP Download/Upload speed
-	if [ $dir = "Bidirectional" ]; then
-		summarize_speed Download $DLFILE
-		summarize_speed Upload $ULFILE
+	if [ "$dir" = "Bidirectional" ]; then
+		summarize_speed Download "$DLFILE"
+		summarize_speed Upload "$ULFILE"
 	else
-		summarize_speed $dir $DLFILE
+		summarize_speed "$dir" "$DLFILE"
 	fi
 
 	# Summarize the ping data
-	summarize_pings $PINGFILE
+	summarize_pings "$PINGFILE"
 
 	# Summarize the load data
-	summarize_load $LOADFILE
+	summarize_load "$LOADFILE"
 
 	# Clean up
-	rm -f $DLFILE
-	rm -f $ULFILE
-	rm -f $PINGFILE
-	rm -f $LOADFILE
+	rm -f "$DLFILE" 2>/dev/null
+	rm -f "$ULFILE" 2>/dev/null
+	rm -f "$PINGFILE" 2>/dev/null
+	rm -f "$LOADFILE" 2>/dev/null
 }
 
 print_usage() {
-	echo \
-"Usage: speedtest-netperf.sh [ -H netperf-server ] [ -p host-to-ping ] [-4 | -6]
-                            [ -i [duration] ] [ -s | -c [duration] ]
-                            [ -t duration ] [ -n simultaneous-streams ]"
+	cat << EOF
+Usage: speedtest-netperf.sh [OPTIONS]
+
+OPTIONS:
+  -H, --host HOST              Netperf server (default: netperf.bufferbloat.net)
+  -4, -6                       Use IPv4 or IPv6 (default: IPv4)
+  -t, --time DURATION          Test duration in seconds (default: 30)
+  -p, --ping HOST              Host to ping (default: one.one.one.one)
+  -n, --number STREAMS         Number of simultaneous streams (default: 5)
+  -s, --sequential             Sequential download then upload
+  -c, --concurrent [DURATION]  Concurrent download and upload
+  -i, --idle [DURATION]        Measure idle latency
+  -o, --output FILE            Save results to file
+  -j, --json                   Output results in JSON format
+  -v, --verbose                Enable verbose output
+  -h, --help                   Show this help message
+  --version                    Show version
+
+EXAMPLES:
+  speedtest-netperf.sh -s -i 30          # Sequential test with 30s idle measure
+  speedtest-netperf.sh -c -H netperf-eu  # Concurrent test to EU server
+  speedtest-netperf.sh -s -o results.txt # Save results to file
+EOF
 }
 
 is_number() {
@@ -410,12 +503,19 @@ TESTSPEED=0
 SPEEDDUR="30"
 TESTIDLE=0
 IDLEDUR="30"
+VERBOSE=0
+OUTPUT_FILE=""
+JSON_OUTPUT=0
+
+# Create secure temp directory
+TEMPDIR=$(mktemp -d) || { echo "Failed to create temp directory"; exit 1; }
+log_verbose "Created temp directory: $TEMPDIR"
 
 # Clear temp files
-DLFILE=
-ULFILE=
-PINGFILE=
-LOADFILE=
+DLFILE=""
+ULFILE=""
+PINGFILE=""
+LOADFILE=""
 
 # Parse options and their parameters into variables. Options for --idle,
 # --sequential and --concurrent have optional parameters.
@@ -424,46 +524,68 @@ do
 	case "$1" in
 		-i|--idle)
 			TESTIDLE=1 ; shift 1
-			is_number "$1" && { IDLEDUR=$1 ; shift 1 ; } ;;
+			is_number "$1" && { IDLEDUR="$1" ; shift 1 ; } ;;
 		-s|--sequential)
 			TESTSPEED=1 ; shift 1
-			is_number "$1" && { SPEEDDUR=$1 ; shift 1 ; } ;;
+			is_number "$1" && { SPEEDDUR="$1" ; shift 1 ; } ;;
 		-c|--concurrent)
 			TESTSPEED=2 ; shift 1
-			is_number "$1" && { SPEEDDUR=$1 ; shift 1 ; } ;;
-		-4|-6) TESTPROTO=$1 ; shift 1 ;;
+			is_number "$1" && { SPEEDDUR="$1" ; shift 1 ; } ;;
+		-4|-6) TESTPROTO="$1" ; shift 1 ;;
 		-H|--host)
 			case "$2" in
-				"") echo "Missing hostname" ; exit 1 ;;
+				"") log_error "Missing hostname" ; exit 1 ;;
 				*) TESTHOST="$2" ; shift 2 ;;
 			esac ;;
 		-t|--time)
-			is_number "$2" || { echo "Missing duration" ; exit 1 ; }
-			IDLEDUR=$2 ; SPEEDDUR=$2 ; shift 2 ;;
+			is_number "$2" || { log_error "Missing or invalid duration" ; exit 1 ; }
+			IDLEDUR="$2" ; SPEEDDUR="$2" ; shift 2 ;;
 		-p|--ping)
 			case "$2" in
-				"") echo "Missing ping host" ; exit 1 ;;
-				*) PINGHOST=$2 ; shift 2 ;;
+				"") log_error "Missing ping host" ; exit 1 ;;
+				*) PINGHOST="$2" ; shift 2 ;;
 			esac ;;
 		-n|--number)
-			is_number $2 || { echo "Missing number of streams" ; exit 1 ; }
-			MAXSTREAMS=$2 ; shift 2 ;;
+			is_number "$2" || { log_error "Missing or invalid number of streams" ; exit 1 ; }
+			MAXSTREAMS="$2" ; shift 2 ;;
+		-o|--output)
+			case "$2" in
+				"") log_error "Missing output file" ; exit 1 ;;
+				*) OUTPUT_FILE="$2" ; shift 2 ;;
+			esac ;;
+		-j|--json)
+			JSON_OUTPUT=1 ; shift 1 ;;
+		-v|--verbose)
+			VERBOSE=1 ; shift 1 ;;
+		-h|--help)
+			print_usage ; exit 0 ;;
+		--version)
+			echo "speedtest-netperf version $SCRIPT_VERSION" ; exit 0 ;;
 		--) shift ; break ;;
-		*) print_usage ; exit 1 ;;
+		*) log_error "Unknown option: $1"; print_usage ; exit 1 ;;
 	esac
 done
 
 # Extra argument validations
 
-if [ $TESTIDLE -eq "0" ] && [ $TESTSPEED -eq "0" ]; then
-	echo "Please select an idle latency test and/or speed test:"
+if [ "$TESTIDLE" -eq 0 ] && [ "$TESTSPEED" -eq 0 ]; then
+	log_error "Please select an idle latency test and/or speed test"
 	print_usage ; exit 1
 fi
 
 # Check dependencies
 
 if ! netperf -V >/dev/null 2>&1; then
-	echo "Missing netperf program, please install" ; exit 1
+	log_error "Missing netperf program, please install"
+	cleanup_temp_files
+	exit 1
+fi
+
+# Check server connectivity
+if ! check_server_connectivity "$TESTHOST" "$TESTPROTO"; then
+	log_error "Cannot proceed with unreachable server"
+	cleanup_temp_files
+	exit 1
 fi
 
 # Catch a Ctl-C and stop background netperf, CPU stats, pinging and print_dots
@@ -473,27 +595,32 @@ trap kill_background_and_exit HUP INT TERM
 
 DATE=$(date "+%Y-%m-%d %H:%M:%S")
 echo -n "$DATE Begin test with "
-[ $TESTIDLE -eq "1" ] && echo -n "$IDLEDUR-second ping"
-[ $(($TESTIDLE * $TESTSPEED)) -ne "0" ] && echo -n ", "
-[ $TESTSPEED -ne "0" ] && echo -n "$SPEEDDUR-second transfer"
+[ "$TESTIDLE" -eq 1 ] && echo -n "$IDLEDUR-second ping"
+[ $(("$TESTIDLE" * "$TESTSPEED")) -ne 0 ] && echo -n ", "
+[ "$TESTSPEED" -ne 0 ] && echo -n "$SPEEDDUR-second transfer"
 echo " sessions."
 
-if [ $TESTIDLE -eq "1" ]; then
+if [ "$TESTIDLE" -eq 1 ]; then
 	echo "Measure idle latency by pinging $PINGHOST (IPv${TESTPROTO#-})."
 	measure_idle
 	echo
 fi
 
-if [ $TESTSPEED -ne "0" ]; then
+if [ "$TESTSPEED" -ne 0 ]; then
 	echo "Measure speed to $TESTHOST (IPv${TESTPROTO#-}) while pinging $PINGHOST."
 	echo -n "Download and upload sessions are "
-	[ "$TESTSPEED" -eq "1" ] && echo -n "sequential," || echo -n "concurrent,"
+	[ "$TESTSPEED" -eq 1 ] && echo -n "sequential," || echo -n "concurrent,"
 	echo " each with $MAXSTREAMS simultaneous streams."
 
-	if [ $TESTSPEED -eq "1" ]; then
+	if [ "$TESTSPEED" -eq 1 ]; then
 		measure_direction "Download"
 		measure_direction "Upload"
 	else
 		measure_direction "Bidirectional"
 	fi
 fi
+
+# Clean up temp directory
+cleanup_temp_files
+
+echo "Test completed successfully at $(date '+%Y-%m-%d %H:%M:%S')"
